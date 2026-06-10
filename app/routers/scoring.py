@@ -177,67 +177,16 @@ def get_match_head_to_head(
         MatchPlayer.match_id == match_id
     ).order_by(MatchPlayer.seat_position).all()
 
-    player_ids = [mp.player_id for mp in match_players]
-
-    past_h2h = {}
-    for i, pid1 in enumerate(player_ids):
-        for j, pid2 in enumerate(player_ids):
-            if i >= j:
-                continue
-            key = f"{min(pid1, pid2)}_{max(pid1, pid2)}"
-            if key in past_h2h:
-                continue
-
-            past_matches = db.query(MatchPlayer).join(Match).filter(
-                Match.tournament_id == match.tournament_id,
-                Match.id != match_id,
-                Match.status.in_([MatchStatus.FINISHED.value, MatchStatus.OVERRIDDEN.value])
-            ).filter(
-                MatchPlayer.match_id.in_(
-                    db.query(MatchPlayer.match_id).filter(
-                        MatchPlayer.player_id.in_([pid1, pid2])
-                    ).group_by(MatchPlayer.match_id).having(
-                        db.func.count(db.func.distinct(MatchPlayer.player_id)) == 2
-                    )
-                )
-            ).filter(
-                MatchPlayer.player_id.in_([pid1, pid2])
-            ).all()
-
-            p1_wins = sum(
-                1 for mp in past_matches
-                if mp.player_id == pid1 and mp.result == ResultType.WIN.value
-            )
-            p2_wins = sum(
-                1 for mp in past_matches
-                if mp.player_id == pid2 and mp.result == ResultType.WIN.value
-            )
-            draws = sum(
-                1 for mp in past_matches
-                if mp.player_id == pid1 and mp.result == ResultType.DRAW.value
-            )
-
-            p1 = db.query(Player).filter(Player.id == pid1).first()
-            p2 = db.query(Player).filter(Player.id == pid2).first()
-
-            past_h2h[key] = {
-                "player1_id": pid1,
-                "player1_name": p1.name if p1 else "",
-                "player1_wins": p1_wins,
-                "player2_id": pid2,
-                "player2_name": p2.name if p2 else "",
-                "player2_wins": p2_wins,
-                "draws": draws,
-                "total_matches": p1_wins + p2_wins + draws,
-            }
+    player_ids = [mp.player_id for mp in match_players if mp.player_id]
 
     current_match = []
     for mp in match_players:
         p = mp.player
         current_match.append({
             "match_player_id": mp.id,
+            "tournament_player_id": mp.tournament_player_id,
             "player_id": mp.player_id,
-            "player_name": p.name if p else "",
+            "player_name": p.name if p else f"选手#{mp.player_id}",
             "team": p.team if p else None,
             "seat_position": mp.seat_position,
             "score": mp.score,
@@ -246,14 +195,129 @@ def get_match_head_to_head(
             "is_winner": mp.is_winner,
         })
 
-    return {
+    basic_info = {
         "match_id": match_id,
         "tournament_id": match.tournament_id,
         "round_number": match.round_number,
+        "room_id": match.room_id,
+        "table_number": match.table_number,
         "match_status": match.status,
-        "current_match": current_match,
-        "head_to_head_history": list(past_h2h.values()),
+        "locked_at": match.locked_at,
+        "started_at": match.start_time,
+        "ended_at": match.end_time,
+        "submitted_by": match.submitted_by,
+        "referee_note": match.referee_note,
     }
+
+    if len(player_ids) < 2:
+        return {
+            **basic_info,
+            "current_match": current_match,
+            "head_to_head_history": [],
+            "note": "本局选手少于2人，无历史交手记录可查",
+        }
+
+    past_h2h = []
+    try:
+        from sqlalchemy import and_, func
+
+        all_other_matches = db.query(Match).filter(
+            Match.tournament_id == match.tournament_id,
+            Match.id != match_id,
+            Match.status.in_([MatchStatus.FINISHED.value, MatchStatus.OVERRIDDEN.value])
+        ).all()
+
+        other_match_ids = [m.id for m in all_other_matches]
+
+        match_players_map: Dict[int, List[int]] = {}
+        if other_match_ids:
+            all_other_mp = db.query(MatchPlayer).filter(
+                MatchPlayer.match_id.in_(other_match_ids)
+            ).all()
+            for omp in all_other_mp:
+                if omp.match_id not in match_players_map:
+                    match_players_map[omp.match_id] = []
+                match_players_map[omp.match_id].append(omp.player_id)
+
+        for i, pid1 in enumerate(player_ids):
+            for j in range(i + 1, len(player_ids)):
+                pid2 = player_ids[j]
+
+                p1 = db.query(Player).filter(Player.id == pid1).first()
+                p2 = db.query(Player).filter(Player.id == pid2).first()
+
+                p1_wins = 0
+                p2_wins = 0
+                draws = 0
+                match_details = []
+
+                for omid in other_match_ids:
+                    om_players = match_players_map.get(omid, [])
+                    if pid1 in om_players and pid2 in om_players:
+                        om_players_data = db.query(MatchPlayer).filter(
+                            MatchPlayer.match_id == omid,
+                            MatchPlayer.player_id.in_([pid1, pid2])
+                        ).all()
+                        om = db.query(Match).filter(Match.id == omid).first()
+
+                        p1_mp = next((x for x in om_players_data if x.player_id == pid1), None)
+                        p2_mp = next((x for x in om_players_data if x.player_id == pid2), None)
+
+                        if p1_mp and p2_mp:
+                            detail = {
+                                "match_id": omid,
+                                "round_number": om.round_number if om else None,
+                                "p1_score": p1_mp.score,
+                                "p1_result": p1_mp.result,
+                                "p2_score": p2_mp.score,
+                                "p2_result": p2_mp.result,
+                                "played_at": om.end_time if om and om.end_time else om.created_at if om else None,
+                            }
+                            match_details.append(detail)
+
+                            if p1_mp.result == ResultType.WIN.value:
+                                p1_wins += 1
+                            elif p2_mp.result == ResultType.WIN.value:
+                                p2_wins += 1
+                            elif p1_mp.result == ResultType.DRAW.value:
+                                draws += 1
+
+                total = p1_wins + p2_wins + draws
+                past_h2h.append({
+                    "player1_id": pid1,
+                    "player1_name": p1.name if p1 else f"选手#{pid1}",
+                    "player1_team": p1.team if p1 else None,
+                    "player1_wins": p1_wins,
+                    "player2_id": pid2,
+                    "player2_name": p2.name if p2 else f"选手#{pid2}",
+                    "player2_team": p2.team if p2 else None,
+                    "player2_wins": p2_wins,
+                    "draws": draws,
+                    "total_matches": total,
+                    "history_detail": sorted(match_details, key=lambda x: x.get("round_number") or 0) if total > 0 else [],
+                })
+
+    except Exception as e:
+        return {
+            **basic_info,
+            "current_match": current_match,
+            "head_to_head_history": [],
+            "note": f"查询历史记录时出现异常，已返回空列表: {str(e)}",
+            "error_detail": str(e) if False else None,
+        }
+
+    has_history = any(h["total_matches"] > 0 for h in past_h2h)
+
+    result = {
+        **basic_info,
+        "current_match": current_match,
+        "head_to_head_history": past_h2h,
+        "has_history": has_history,
+    }
+    if not has_history:
+        result["note"] = "本桌选手之间暂无历史交手记录"
+
+    return result
 
 
 @router.post("/{tournament_id}/recalculate-ranks")
