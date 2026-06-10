@@ -25,9 +25,11 @@ class MatchStatus(str, enum.Enum):
     PENDING = "pending"
     LOCKED = "locked"
     ONGOING = "ongoing"
+    PENDING_CONFIRMATION = "pending_confirmation"
     FINISHED = "finished"
     CANCELLED = "cancelled"
     OVERRIDDEN = "overridden"
+    REJECTED = "rejected"
 
 
 class ResultType(str, enum.Enum):
@@ -174,7 +176,14 @@ class Match(Base):
     locked_at = Column(DateTime, nullable=True)
     submitted_by = Column(String(100), nullable=True)
     submitted_at = Column(DateTime, nullable=True)
-    submission_hash = Column(String(64), nullable=True, unique=True)
+    submission_hash = Column(String(64), nullable=True)
+    content_fingerprint = Column(String(64), nullable=True)
+    confirmed_by = Column(String(100), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    rejected_by = Column(String(100), nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    rejection_reason = Column(Text, nullable=True)
+    rejection_count = Column(Integer, default=0)
     referee_note = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

@@ -1,7 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse, JSONResponse
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
+from io import StringIO, BytesIO
+import csv
 import json
 import hashlib
 
@@ -182,6 +185,8 @@ def override_match_score(
 
     original_status = match.status
     match.status = MatchStatus.OVERRIDDEN.value
+    match.confirmed_by = f"裁判改判:{referee.name}"
+    match.confirmed_at = datetime.now()
     if match.referee_note:
         match.referee_note += f" | 改判: {request.reason} (裁判:{referee.name})"
     else:
@@ -192,10 +197,16 @@ def override_match_score(
     new_mp_list = db.query(MatchPlayer).filter(MatchPlayer.match_id == match_id).all()
     new_score_data = serialize_match_scores(new_mp_list)
 
+    change_type = "score_override"
+    if original_status in [MatchStatus.PENDING_CONFIRMATION.value, MatchStatus.REJECTED.value]:
+        change_type = "confirm_override"
+    elif original_status != MatchStatus.FINISHED.value:
+        change_type = "score_set"
+
     change_log = ScoreChangeLog(
         match_id=match_id,
         referee_id=request.referee_id,
-        change_type="score_override" if original_status == MatchStatus.FINISHED.value else "score_set",
+        change_type=change_type,
         old_score_data=old_score_data,
         new_score_data=new_score_data,
         reason=request.reason
@@ -748,3 +759,146 @@ def get_tournament_audit_log_legacy(
         },
         "audit_logs": audit_detail,
     }
+
+
+def _build_audit_export_query(
+    db: Session,
+    tournament_id: Optional[int] = None,
+    referee_id: Optional[int] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
+):
+    query = db.query(ScoreChangeLog)
+
+    if tournament_id:
+        tournament = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+        if not tournament:
+            raise HTTPException(status_code=404, detail=f"赛事 tournament_id={tournament_id} 不存在")
+        query = query.join(Match, ScoreChangeLog.match_id == Match.id).filter(
+            Match.tournament_id == tournament_id
+        )
+
+    if referee_id:
+        referee = db.query(Referee).filter(Referee.id == referee_id).first()
+        if not referee:
+            raise HTTPException(status_code=404, detail=f"裁判 referee_id={referee_id} 不存在")
+        query = query.filter(ScoreChangeLog.referee_id == referee_id)
+
+    if start_date:
+        query = query.filter(ScoreChangeLog.created_at >= start_date)
+    if end_date:
+        query = query.filter(ScoreChangeLog.created_at <= end_date)
+
+    return query.order_by(ScoreChangeLog.id.desc())
+
+
+def _format_log_for_export(log, db: Session) -> dict:
+    referee = db.query(Referee).filter(Referee.id == log.referee_id).first() if log.referee_id else None
+    match_obj = db.query(Match).filter(Match.id == log.match_id).first()
+
+    old_data = json.loads(log.old_score_data) if log.old_score_data else []
+    new_data = json.loads(log.new_score_data) if log.new_score_data else []
+
+    old_scores_str = "; ".join(
+        f"选手#{s.get('player_id', '?')}={s.get('score', 0)}({s.get('result', '?')})"
+        for s in old_data
+    ) if old_data else ""
+
+    new_scores_str = "; ".join(
+        f"选手#{s.get('player_id', '?')}={s.get('score', 0)}({s.get('result', '?')})"
+        for s in new_data
+    ) if new_data else ""
+
+    return {
+        "log_id": log.id,
+        "match_id": log.match_id,
+        "tournament_id": match_obj.tournament_id if match_obj else None,
+        "round_number": match_obj.round_number if match_obj else None,
+        "table_number": match_obj.table_number if match_obj else None,
+        "change_type": log.change_type,
+        "referee_id": log.referee_id,
+        "referee_name": referee.name if referee else None,
+        "referee_role": referee.role if referee else None,
+        "old_scores": old_scores_str,
+        "new_scores": new_scores_str,
+        "old_scores_detail": old_data,
+        "new_scores_detail": new_data,
+        "reason": log.reason,
+        "operation_time": log.created_at.isoformat() if log.created_at else None,
+    }
+
+
+@router.get("/audit/export")
+def export_audit_records(
+    format: str = Query("json", description="导出格式: json / csv"),
+    tournament_id: Optional[int] = Query(None, description="按赛事ID筛选"),
+    referee_id: Optional[int] = Query(None, description="按裁判ID筛选"),
+    start_date: Optional[datetime] = Query(None, description="起始时间 (>=)"),
+    end_date: Optional[datetime] = Query(None, description="结束时间 (<=)"),
+    db: Session = Depends(get_db)
+):
+    query = _build_audit_export_query(db, tournament_id, referee_id, start_date, end_date)
+    change_logs = query.all()
+
+    if not change_logs:
+        if format.lower() == "csv":
+            output = StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["log_id", "match_id", "tournament_id", "round_number", "table_number",
+                             "change_type", "referee_id", "referee_name", "old_scores", "new_scores",
+                             "reason", "operation_time"])
+            output.seek(0)
+            return StreamingResponse(
+                iter([output.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=audit_export.csv"}
+            )
+        return JSONResponse(
+            content={"total_records": 0, "records": [], "message": "没有匹配的改判记录"},
+            media_type="application/json"
+        )
+
+    records = [_format_log_for_export(log, db) for log in change_logs]
+
+    if format.lower() == "csv":
+        output = StringIO()
+        if records:
+            fieldnames = ["log_id", "match_id", "tournament_id", "round_number", "table_number",
+                          "change_type", "referee_id", "referee_name", "old_scores", "new_scores",
+                          "reason", "operation_time"]
+            writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for record in records:
+                writer.writerow(record)
+
+        output.seek(0)
+        byte_output = BytesIO()
+        byte_output.write(output.getvalue().encode("utf-8-sig"))
+        byte_output.seek(0)
+
+        filename = f"audit_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        return StreamingResponse(
+            iter([byte_output.getvalue()]),
+            media_type="text/csv; charset=utf-8-sig",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    filename = f"audit_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    export_data = {
+        "export_time": datetime.now().isoformat(),
+        "filters": {
+            "tournament_id": tournament_id,
+            "referee_id": referee_id,
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat() if end_date else None,
+        },
+        "total_records": len(records),
+        "records": records,
+    }
+
+    json_content = json.dumps(export_data, ensure_ascii=False, indent=2, default=str)
+    return StreamingResponse(
+        iter([json_content.encode("utf-8")]),
+        media_type="application/json",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )

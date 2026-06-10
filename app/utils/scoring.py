@@ -188,6 +188,23 @@ def generate_submission_hash(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def generate_content_fingerprint(
+    match_id: int,
+    scores: List[Dict]
+) -> str:
+    content_data = {
+        "match_id": match_id,
+        "scores": sorted(
+            [{"match_player_id": s.get("match_player_id"), "score": s.get("score"),
+              "result": s.get("result"), "tiebreaker_score": s.get("tiebreaker_score", 0)}
+             for s in scores],
+            key=lambda x: x.get("match_player_id", 0)
+        ),
+    }
+    raw = json.dumps(content_data, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def check_duplicate_submission(
     db: Session,
     match_id: int,

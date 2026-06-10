@@ -250,6 +250,12 @@ class MatchResponse(MatchBase):
     locked_at: Optional[datetime] = None
     submitted_by: Optional[str] = None
     submitted_at: Optional[datetime] = None
+    confirmed_by: Optional[str] = None
+    confirmed_at: Optional[datetime] = None
+    rejected_by: Optional[str] = None
+    rejected_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    rejection_count: Optional[int] = 0
     referee_note: Optional[str] = None
     match_players: List[MatchPlayerResponse] = []
     created_at: datetime
@@ -257,6 +263,14 @@ class MatchResponse(MatchBase):
 
     class Config:
         from_attributes = True
+
+
+class MatchConfirmRequest(BaseModel):
+    confirmed_by: str = Field(..., max_length=100)
+
+class MatchRejectRequest(BaseModel):
+    rejected_by: str = Field(..., max_length=100)
+    rejection_reason: str = Field(..., min_length=1, max_length=1000)
 
 
 class FoulBase(BaseModel):

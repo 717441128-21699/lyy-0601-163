@@ -11,11 +11,11 @@ from app.models import (
 )
 from app.schemas import (
     MatchCreate, MatchResponse, MatchResultSubmit,
-    MatchPlayerResponse
+    MatchPlayerResponse, MatchConfirmRequest, MatchRejectRequest
 )
 from app.utils.scoring import (
-    generate_submission_hash, check_duplicate_submission,
-    serialize_match_scores
+    generate_submission_hash, generate_content_fingerprint,
+    check_duplicate_submission, serialize_match_scores
 )
 
 router = APIRouter(prefix="/matches", tags=["对局管理"])
@@ -60,6 +60,12 @@ def _build_match_response(match: Match, db: Session) -> MatchResponse:
         locked_at=match.locked_at,
         submitted_by=match.submitted_by,
         submitted_at=match.submitted_at,
+        confirmed_by=match.confirmed_by,
+        confirmed_at=match.confirmed_at,
+        rejected_by=match.rejected_by,
+        rejected_at=match.rejected_at,
+        rejection_reason=match.rejection_reason,
+        rejection_count=match.rejection_count,
         referee_note=match.referee_note,
         match_players=player_responses,
         created_at=match.created_at,
@@ -292,49 +298,75 @@ def submit_match_result(
         raise HTTPException(status_code=404, detail="对局不存在")
 
     if match.status == MatchStatus.FINISHED.value:
-        existing_data = serialize_match_scores(
-            db.query(MatchPlayer).filter(MatchPlayer.match_id == match_id).all()
-        )
         new_scores_data = [s.model_dump() for s in result.scores]
-        new_hash = generate_submission_hash(match_id, new_scores_data)
+        new_fingerprint = generate_content_fingerprint(match_id, new_scores_data)
 
-        is_same_result = False
-        if match.submission_hash and match.submission_hash == new_hash:
-            is_same_result = True
+        is_same_result = bool(match.content_fingerprint and match.content_fingerprint == new_fingerprint)
 
-        error_msg = ""
         if is_same_result:
             error_msg = (
-                "⚠️ 检测到重复提交：成绩与已提交的完全一致，原成绩不会被覆盖。\n"
-                "📋 该对局已提交的成绩已存在，如需修改请使用【裁判改判】接口：\n"
-                "   POST /api/v1/referees/matches/{match_id}/override\n"
-                "   改判会记录操作人、时间、原因和变更内容，全程留痕可审计。"
+                "⚠️ 检测到重复提交：提交的成绩与已确认的完全一致，原成绩不会被覆盖。\n"
+                "📋 该对局成绩已确认生效，如需修改请使用【裁判改判】接口：\n"
+                "   POST /api/v1/referees/matches/{match_id}/override"
             )
         else:
             error_msg = (
-                "🚫 该对局已提交过成绩，不能再次通过普通提交接口修改。\n"
-                f"📌 当前对局状态：{match.status}，提交人：{match.submitted_by or '未知'}，提交时间：{match.submitted_at}\n"
+                "🚫 该对局成绩已确认（FINISHED），不能通过普通提交修改。\n"
+                f"📌 提交人：{match.submitted_by or '未知'}，确认人：{match.confirmed_by or '未知'}，确认时间：{match.confirmed_at}\n"
                 "📋 如需修改比分，请使用【裁判改判】接口：\n"
                 "   POST /api/v1/referees/matches/{match_id}/override\n"
-                "   改判需要提供裁判ID和修改原因，系统将自动记录完整的审计日志。"
+                "   改判需要提供裁判ID和修改原因，全程留痕可审计。"
             )
 
         raise HTTPException(status_code=409, detail=error_msg)
+
+    if match.status == MatchStatus.PENDING_CONFIRMATION.value:
+        new_scores_data = [s.model_dump() for s in result.scores]
+        new_fingerprint = generate_content_fingerprint(match_id, new_scores_data)
+
+        is_same_result = bool(match.content_fingerprint and match.content_fingerprint == new_fingerprint)
+
+        if is_same_result:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "⚠️ 检测到重复提交：提交的成绩与待确认的成绩完全一致，无需重复提交。\n"
+                    f"📌 当前状态：待确认（pending_confirmation），提交人：{match.submitted_by}，提交时间：{match.submitted_at}\n"
+                    "📋 请等待裁判确认。如需修改，可等待驳回后重新提交，或使用裁判改判接口。"
+                )
+            )
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "🚫 该对局已有待确认的成绩，不能重复提交不同分数。\n"
+                    f"📌 当前状态：待确认（pending_confirmation），原提交人：{match.submitted_by}\n"
+                    "📋 处理方式：\n"
+                    "   1. 等待裁判确认或驳回后再操作\n"
+                    "   2. 使用【裁判改判】接口直接修改：POST /api/v1/referees/matches/{match_id}/override"
+                )
+            )
 
     if match.status == MatchStatus.OVERRIDDEN.value:
         raise HTTPException(
             status_code=409,
             detail=(
-                "🚫 该对局已被裁判改判，不能再次通过普通提交接口修改。\n"
-                "📋 如需再次修改，请继续使用【裁判改判】接口，所有改判操作都会被完整记录。\n"
+                "🚫 该对局已被裁判改判，不能通过普通提交接口修改。\n"
+                "📋 如需再次修改，请继续使用【裁判改判】接口。\n"
                 "   查看改判历史：GET /api/v1/referees/matches/{match_id}/change-logs"
             )
         )
 
+    if match.status == MatchStatus.REJECTED.value:
+        match.status = MatchStatus.ONGOING.value
+        match.rejection_reason = None
+        match.rejected_by = None
+        match.rejected_at = None
+
     if match.status not in [MatchStatus.LOCKED.value, MatchStatus.ONGOING.value]:
         raise HTTPException(
             status_code=400,
-            detail=f"当前状态为{match.status}，无法提交结果。允许的状态：locked、ongoing"
+            detail=f"当前状态为{match.status}，无法提交结果。允许的状态：locked、ongoing、rejected"
         )
 
     valid_results = [r.value for r in ResultType]
@@ -352,6 +384,7 @@ def submit_match_result(
 
     scores_data = [s.model_dump() for s in result.scores]
     submission_hash = generate_submission_hash(match_id, scores_data)
+    content_fingerprint = generate_content_fingerprint(match_id, scores_data)
 
     existing_mp_ids = {mp.id for mp in db.query(MatchPlayer).filter(MatchPlayer.match_id == match_id).all()}
     submitted_ids = {s.match_player_id for s in result.scores}
@@ -379,16 +412,19 @@ def submit_match_result(
             mp.tiebreaker_score = s.tiebreaker_score or 0.0
             mp.is_winner = (s.result == ResultType.WIN.value)
 
-    match.status = MatchStatus.FINISHED.value
+    match.status = MatchStatus.PENDING_CONFIRMATION.value
     match.submitted_by = result.submitted_by
     match.submitted_at = datetime.now()
     match.submission_hash = submission_hash
+    match.content_fingerprint = content_fingerprint
     if result.end_time:
         match.end_time = result.end_time
     else:
         match.end_time = datetime.now()
     if result.referee_note:
         match.referee_note = result.referee_note
+    match.confirmed_by = None
+    match.confirmed_at = None
 
     db.commit()
     db.refresh(match)
@@ -402,8 +438,8 @@ def delete_match(match_id: int, db: Session = Depends(get_db)):
     if not match:
         raise HTTPException(status_code=404, detail="对局不存在")
 
-    if match.status in [MatchStatus.FINISHED.value, MatchStatus.OVERRIDDEN.value]:
-        raise HTTPException(status_code=400, detail="已完成或改判的对局无法删除，请联系裁判改判")
+    if match.status in [MatchStatus.FINISHED.value, MatchStatus.OVERRIDDEN.value, MatchStatus.PENDING_CONFIRMATION.value]:
+        raise HTTPException(status_code=400, detail="已提交/已确认/已改判的对局无法删除，请联系裁判处理")
 
     db.query(MatchPlayer).filter(MatchPlayer.match_id == match_id).delete()
     db.delete(match)
@@ -417,8 +453,8 @@ def cancel_match(match_id: int, reason: Optional[str] = None, db: Session = Depe
     if not match:
         raise HTTPException(status_code=404, detail="对局不存在")
 
-    if match.status == MatchStatus.FINISHED.value:
-        raise HTTPException(status_code=400, detail="已完成的对局无法取消，请联系裁判改判")
+    if match.status in [MatchStatus.FINISHED.value, MatchStatus.OVERRIDDEN.value, MatchStatus.PENDING_CONFIRMATION.value]:
+        raise HTTPException(status_code=400, detail="已提交/已确认/已改判的对局无法取消，请联系裁判处理")
 
     match.status = MatchStatus.CANCELLED.value
     if reason:
@@ -430,6 +466,175 @@ def cancel_match(match_id: int, reason: Optional[str] = None, db: Session = Depe
     db.refresh(match)
 
     return _build_match_response(match, db)
+
+
+@router.post("/{match_id}/confirm", response_model=MatchResponse)
+def confirm_match_result(
+    match_id: int,
+    request: MatchConfirmRequest,
+    db: Session = Depends(get_db)
+):
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="对局不存在")
+
+    if match.status != MatchStatus.PENDING_CONFIRMATION.value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前状态为{match.status}，只能确认待确认（pending_confirmation）状态的对局"
+        )
+
+    match_players = db.query(MatchPlayer).filter(MatchPlayer.match_id == match_id).all()
+    for mp in match_players:
+        if mp.result is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"选手 player_id={mp.player_id} 的比赛结果尚未填写，无法确认"
+            )
+
+    match.status = MatchStatus.FINISHED.value
+    match.confirmed_by = request.confirmed_by
+    match.confirmed_at = datetime.now()
+
+    db.commit()
+    db.refresh(match)
+
+    return _build_match_response(match, db)
+
+
+@router.post("/{match_id}/reject", response_model=MatchResponse)
+def reject_match_result(
+    match_id: int,
+    request: MatchRejectRequest,
+    db: Session = Depends(get_db)
+):
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="对局不存在")
+
+    if match.status not in [MatchStatus.PENDING_CONFIRMATION.value]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"当前状态为{match.status}，只能驳回待确认（pending_confirmation）状态的对局"
+        )
+
+    match.status = MatchStatus.REJECTED.value
+    match.rejected_by = request.rejected_by
+    match.rejected_at = datetime.now()
+    match.rejection_reason = request.rejection_reason
+    match.rejection_count = (match.rejection_count or 0) + 1
+
+    db.commit()
+    db.refresh(match)
+
+    return _build_match_response(match, db)
+
+
+@router.get("/{match_id}/confirmation-status")
+def get_confirmation_status(match_id: int, db: Session = Depends(get_db)):
+    match = db.query(Match).filter(Match.id == match_id).first()
+    if not match:
+        raise HTTPException(status_code=404, detail="对局不存在")
+
+    match_players = db.query(MatchPlayer).filter(
+        MatchPlayer.match_id == match_id
+    ).order_by(MatchPlayer.seat_position).all()
+
+    scores_summary = []
+    for mp in match_players:
+        p = mp.player
+        scores_summary.append({
+            "player_id": mp.player_id,
+            "player_name": p.name if p else f"选手#{mp.player_id}",
+            "seat_position": mp.seat_position,
+            "score": mp.score,
+            "result": mp.result,
+            "tiebreaker_score": mp.tiebreaker_score,
+        })
+
+    result = {
+        "match_id": match_id,
+        "tournament_id": match.tournament_id,
+        "round_number": match.round_number,
+        "table_number": match.table_number,
+        "status": match.status,
+        "submitted_by": match.submitted_by,
+        "submitted_at": match.submitted_at,
+        "confirmed_by": match.confirmed_by,
+        "confirmed_at": match.confirmed_at,
+        "rejected_by": match.rejected_by,
+        "rejected_at": match.rejected_at,
+        "rejection_reason": match.rejection_reason,
+        "rejection_count": match.rejection_count or 0,
+        "can_resubmit": match.status == MatchStatus.REJECTED.value,
+        "scores": scores_summary,
+    }
+
+    if match.status == MatchStatus.REJECTED.value:
+        result["resubmit_instruction"] = (
+            "成绩已被驳回，可重新提交：POST /api/v1/matches/{match_id}/submit-result\n"
+            f"驳回原因：{match.rejection_reason}"
+        )
+
+    return result
+
+
+@router.get("/tournament/{tournament_id}/pending-confirmations")
+def list_pending_confirmations(
+    tournament_id: int,
+    round_number: Optional[int] = None,
+    db: Session = Depends(get_db)
+):
+    tournament = db.query(Tournament).filter(Tournament.id == tournament_id).first()
+    if not tournament:
+        raise HTTPException(status_code=404, detail="赛事不存在")
+
+    query = db.query(Match).filter(
+        Match.tournament_id == tournament_id,
+        Match.status == MatchStatus.PENDING_CONFIRMATION.value
+    )
+    if round_number:
+        query = query.filter(Match.round_number == round_number)
+
+    pending_matches = query.order_by(Match.round_number, Match.table_number).all()
+
+    result = []
+    for match in pending_matches:
+        room = match.room
+        match_players = db.query(MatchPlayer).filter(
+            MatchPlayer.match_id == match.id
+        ).order_by(MatchPlayer.seat_position).all()
+
+        players_info = []
+        for mp in match_players:
+            p = mp.player
+            players_info.append({
+                "player_id": mp.player_id,
+                "player_name": p.name if p else "",
+                "team": p.team if p else None,
+                "seat_position": mp.seat_position,
+                "score": mp.score,
+                "result": mp.result,
+                "is_winner": mp.is_winner,
+            })
+
+        result.append({
+            "match_id": match.id,
+            "round_number": match.round_number,
+            "table_number": match.table_number,
+            "room_name": room.name if room else None,
+            "submitted_by": match.submitted_by,
+            "submitted_at": match.submitted_at,
+            "players": players_info,
+        })
+
+    return {
+        "tournament_id": tournament_id,
+        "tournament_name": tournament.name,
+        "pending_count": len(result),
+        "round_filter": round_number,
+        "pending_matches": result,
+    }
 
 
 @router.get("/tournament/{tournament_id}/status-summary")
@@ -455,9 +660,11 @@ def get_tournament_match_status_summary(
                 "pending": 0,
                 "locked": 0,
                 "ongoing": 0,
+                "pending_confirmation": 0,
                 "finished": 0,
                 "cancelled": 0,
                 "overridden": 0,
+                "rejected": 0,
             }
         summary[rn]["total"] += 1
         status_key = match.status

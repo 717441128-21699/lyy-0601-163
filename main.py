@@ -17,10 +17,52 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _migrate_new_columns(engine)
     logger.info(f"数据库初始化完成: {settings.DATABASE_URL}")
     logger.info(f"服务 '{settings.PROJECT_NAME}' 启动成功")
     yield
     logger.info("服务关闭中...")
+
+
+def _migrate_new_columns(engine):
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+
+    import sqlalchemy
+    with engine.connect() as conn:
+        inspector = sqlalchemy.inspect(engine)
+        existing_cols = {col["name"] for col in inspector.get_columns("matches")}
+
+        new_columns = [
+            ("confirmed_by", "VARCHAR(100)"),
+            ("confirmed_at", "DATETIME"),
+            ("rejected_by", "VARCHAR(100)"),
+            ("rejected_at", "DATETIME"),
+            ("rejection_reason", "TEXT"),
+            ("rejection_count", "INTEGER DEFAULT 0"),
+            ("content_fingerprint", "VARCHAR(64)"),
+        ]
+
+        for col_name, col_type in new_columns:
+            if col_name not in existing_cols:
+                conn.execute(sqlalchemy.text(
+                    f"ALTER TABLE matches ADD COLUMN {col_name} {col_type}"
+                ))
+        conn.commit()
+
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        return
+
+    try:
+        import os
+        db_path = settings.DATABASE_URL.replace("sqlite:///", "")
+        if db_path and os.path.exists(db_path):
+            import shutil
+            backup_path = db_path + ".bak"
+            if not os.path.exists(backup_path):
+                shutil.copy2(db_path, backup_path)
+    except Exception:
+        pass
 
 
 app = FastAPI(
